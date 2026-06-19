@@ -3,7 +3,7 @@ Vector store management using ChromaDB + Google Generative AI Embeddings.
 
 Embedding Model Choice
 ──────────────────────
-* ``models/embedding-001`` from Google — free tier, 768-dim vectors.
+* ``models/gemini-embedding-001`` from Google — free tier, 3072-dim vectors.
 * Accessed via ``langchain-google-genai`` so no local GPU / torch needed.
 * ChromaDB runs **in-memory** for Streamlit Cloud compatibility.
 """

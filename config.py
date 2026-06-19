@@ -22,7 +22,7 @@ def get_api_key() -> str | None:
 
 # ── Model settings ────────────────────────────────────────────────
 LLM_MODEL = "gemini-2.5-flash"
-EMBEDDING_MODEL = "models/embedding-001"
+EMBEDDING_MODEL = "models/gemini-embedding-001"
 
 # ── Chunking ──────────────────────────────────────────────────────
 CHUNK_SIZE = 1_000
