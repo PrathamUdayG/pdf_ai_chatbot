@@ -7,15 +7,21 @@ Retrieval Approach
 * **BM25 search** (weight 0.3): exact keyword matching for precision.
 * Results are merged using Reciprocal Rank Fusion (RRF).
 * Returns top-*k* most relevant chunks (default k = 5).
+* Includes retry logic with exponential backoff for API rate limits.
 """
 
 from __future__ import annotations
+
+import time
+import logging
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
 
 from config import TOP_K, BM25_WEIGHT, VECTOR_WEIGHT
+
+logger = logging.getLogger(__name__)
 
 
 class HybridRetriever:
@@ -42,21 +48,52 @@ class HybridRetriever:
     # ── Public API (same interface as LangChain retrievers) ───
     def invoke(self, query: str) -> list[Document]:
         """Retrieve top-k documents using hybrid search."""
-        # Vector results
-        vector_docs = self.vector_store.similarity_search(query, k=self.k)
+        # Vector results (with retry for rate limits)
+        vector_docs = self._vector_search_with_retry(query)
 
-        # BM25 results
+        # BM25 results (local, no API call)
+        bm25_docs = self._bm25_search(query)
+
+        # Reciprocal Rank Fusion
+        return self._rrf_merge(bm25_docs, vector_docs)
+
+    # ── Vector search with retry ──────────────────────────────
+    def _vector_search_with_retry(
+        self, query: str, max_retries: int = 3
+    ) -> list[Document]:
+        """Similarity search with exponential backoff for API rate limits."""
+        for attempt in range(max_retries):
+            try:
+                return self.vector_store.similarity_search(query, k=self.k)
+            except Exception as e:
+                error_str = str(e).lower()
+                is_retryable = any(
+                    kw in error_str
+                    for kw in ("429", "rate", "quota", "resource_exhausted")
+                )
+                if is_retryable and attempt < max_retries - 1:
+                    wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                    logger.warning(
+                        "Embedding rate-limited (attempt %d/%d). "
+                        "Retrying in %ds…",
+                        attempt + 1, max_retries, wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    raise
+        return []  # unreachable, but keeps type checker happy
+
+    # ── BM25 search (local, no API) ───────────────────────────
+    def _bm25_search(self, query: str) -> list[Document]:
+        """Keyword search via BM25 — runs locally, never rate-limited."""
         tokenised_query = query.lower().split()
         bm25_scores = self.bm25.get_scores(tokenised_query)
-        top_bm25_indices = sorted(
+        top_indices = sorted(
             range(len(bm25_scores)),
             key=lambda i: bm25_scores[i],
             reverse=True,
         )[: self.k]
-        bm25_docs = [self.chunks[i] for i in top_bm25_indices]
-
-        # Reciprocal Rank Fusion
-        return self._rrf_merge(bm25_docs, vector_docs)
+        return [self.chunks[i] for i in top_indices]
 
     # ── Reciprocal Rank Fusion ────────────────────────────────
     def _rrf_merge(
@@ -71,7 +108,6 @@ class HybridRetriever:
 
         for rank, doc in enumerate(bm25_docs):
             doc_id = id(doc)
-            # Try matching by content for deduplication
             matched_id = self._find_match_id(doc, doc_map)
             if matched_id is not None:
                 doc_id = matched_id
