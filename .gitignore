@@ -35,5 +35,5 @@ build/
 # Byte-compiled
 *.pyc
 
-# Streamlit
+# Streamlit secrets
 .streamlit/secrets.toml
