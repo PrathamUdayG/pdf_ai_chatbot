@@ -46,42 +46,78 @@ class HybridRetriever:
         self.bm25 = BM25Okapi(tokenised)
 
     # ── Public API (same interface as LangChain retrievers) ───
-    def invoke(self, query: str) -> list[Document]:
-        """Retrieve top-k documents using hybrid search."""
-        # Vector results (with retry for rate limits)
-        vector_docs = self._vector_search_with_retry(query)
+    def invoke(self, query: str) -> tuple[list[Document], bool]:
+        """Retrieve top-k documents using hybrid search.
 
-        # BM25 results (local, no API call)
+        Returns
+        -------
+        (documents, used_fallback)
+            *used_fallback* is True when vector search failed and only
+            BM25 keyword results are returned.
+        """
+        # Sanitise query — very long strings can trigger API errors
+        query = self._sanitise_query(query)
+
+        # BM25 results (local, no API call — always succeeds)
         bm25_docs = self._bm25_search(query)
 
-        # Reciprocal Rank Fusion
-        return self._rrf_merge(bm25_docs, vector_docs)
+        # Vector results (calls Google API, may fail)
+        vector_docs, vector_ok = self._vector_search_safe(query)
 
-    # ── Vector search with retry ──────────────────────────────
-    def _vector_search_with_retry(
+        if vector_ok and vector_docs:
+            # Full hybrid: Reciprocal Rank Fusion
+            return self._rrf_merge(bm25_docs, vector_docs), False
+
+        # Fallback: BM25 only
+        logger.warning("Using BM25-only fallback (vector search unavailable).")
+        return bm25_docs[: self.k], True
+
+    # ── Query sanitisation ────────────────────────────────────
+    @staticmethod
+    def _sanitise_query(query: str, max_chars: int = 8_000) -> str:
+        """Truncate excessively long queries that can cause API errors."""
+        if not query or not query.strip():
+            return "general summary"
+        query = query.strip()
+        if len(query) > max_chars:
+            logger.warning("Query truncated from %d to %d chars.", len(query), max_chars)
+            query = query[:max_chars]
+        return query
+
+    # ── Vector search with graceful degradation ───────────────
+    def _vector_search_safe(
         self, query: str, max_retries: int = 3
-    ) -> list[Document]:
-        """Similarity search with exponential backoff for API rate limits."""
+    ) -> tuple[list[Document], bool]:
+        """Try vector search with retries; return ([], False) on persistent failure."""
+        last_error = None
         for attempt in range(max_retries):
             try:
-                return self.vector_store.similarity_search(query, k=self.k)
+                docs = self.vector_store.similarity_search(query, k=self.k)
+                return docs, True
             except Exception as e:
+                last_error = e
                 error_str = str(e).lower()
                 is_retryable = any(
                     kw in error_str
-                    for kw in ("429", "rate", "quota", "resource_exhausted")
+                    for kw in ("429", "rate", "quota", "resource_exhausted", "500", "internal")
                 )
                 if is_retryable and attempt < max_retries - 1:
-                    wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                    wait = 2 ** (attempt + 2)  # 4s, 8s, 16s
                     logger.warning(
-                        "Embedding rate-limited (attempt %d/%d). "
-                        "Retrying in %ds…",
+                        "Embedding API error (attempt %d/%d). "
+                        "Retrying in %ds… Error: %s",
                         attempt + 1, max_retries, wait,
+                        str(e)[:150],
                     )
                     time.sleep(wait)
                 else:
-                    raise
-        return []  # unreachable, but keeps type checker happy
+                    break  # non-retryable or exhausted retries
+
+        logger.error(
+            "Vector search failed after %d attempts. Falling back to BM25. "
+            "Last error: %s", max_retries, str(last_error)[:200],
+        )
+        return [], False
 
     # ── BM25 search (local, no API) ───────────────────────────
     def _bm25_search(self, query: str) -> list[Document]:

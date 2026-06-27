@@ -34,18 +34,20 @@ def build_vector_store(chunks, api_key: str) -> Chroma:
     embeddings = get_embeddings(api_key)
     
     # Process in small batches to respect free tier limits
-    batch_size = 20
+    batch_size = 10
     vector_store = Chroma(
         collection_name="pdf_collection",
         embedding_function=embeddings,
     )
     
+    total_batches = (len(chunks) - 1) // batch_size + 1
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i : i + batch_size]
-        logger.info(f"Adding batch {i//batch_size + 1}/{(len(chunks)-1)//batch_size + 1}")
+        batch_num = i // batch_size + 1
+        logger.info(f"Adding batch {batch_num}/{total_batches}")
         
-        # Add retry logic for adding documents as well
-        max_retries = 3
+        # Retry with exponential backoff for transient API errors
+        max_retries = 5
         for attempt in range(max_retries):
             try:
                 vector_store.add_documents(batch)
@@ -54,21 +56,22 @@ def build_vector_store(chunks, api_key: str) -> Chroma:
                 error_str = str(e).lower()
                 is_retryable = any(
                     kw in error_str
-                    for kw in ("429", "rate", "quota", "resource_exhausted")
+                    for kw in ("429", "rate", "quota", "resource_exhausted", "500", "internal")
                 )
                 if is_retryable and attempt < max_retries - 1:
-                    wait = 5 * (attempt + 1)  # 5s, 10s
+                    wait = 2 ** (attempt + 2)  # 4s, 8s, 16s, 32s
                     logger.warning(
-                        "Embedding rate-limited on doc add (attempt %d/%d). "
-                        "Retrying in %ds…",
-                        attempt + 1, max_retries, wait,
+                        "Google API error on batch %d (attempt %d/%d). "
+                        "Retrying in %ds… Error: %s",
+                        batch_num, attempt + 1, max_retries, wait,
+                        str(e)[:120],
                     )
                     time.sleep(wait)
                 else:
                     raise
         
-        # Small delay between successful batches to avoid hitting RPM limits
+        # Cooldown between successful batches to avoid hitting RPM limits
         if i + batch_size < len(chunks):
-            time.sleep(2)
+            time.sleep(3)
             
     return vector_store

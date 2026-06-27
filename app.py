@@ -308,31 +308,60 @@ else:
 
         # ── Contextualise question ────────────────────────────
         if chat_history:
-            ctx_chain = build_contextualise_chain(llm)
-            standalone_q = ctx_chain.invoke(
-                {"input": question, "chat_history": chat_history}
-            )
+            try:
+                ctx_chain = build_contextualise_chain(llm)
+                standalone_q = ctx_chain.invoke(
+                    {"input": question, "chat_history": chat_history}
+                )
+            except Exception:
+                standalone_q = question
         else:
             standalone_q = question
 
         # ── Retrieve relevant chunks ──────────────────────────
         retriever = st.session_state.retriever
-        retrieved_docs = retriever.invoke(standalone_q)
+        try:
+            retrieved_docs, used_fallback = retriever.invoke(standalone_q)
+        except Exception as e:
+            st.error(
+                f"⚠️ Retrieval failed: {str(e)[:200]}\n\n"
+                "Google's embedding API may be temporarily down. "
+                "Please try again in a few seconds."
+            )
+            st.stop()
+
         context = format_documents(retrieved_docs)
         citations = extract_citations(retrieved_docs)
+
+        # Show fallback warning if vector search was unavailable
+        if used_fallback:
+            st.warning(
+                "⚡ Google's embedding API is temporarily unavailable. "
+                "Using keyword-only search — results may be less precise. "
+                "Try again shortly for full hybrid search.",
+                icon="⚠️",
+            )
 
         # ── Stream answer ─────────────────────────────────────
         answer_chain = build_answer_chain(llm)
         with st.chat_message("assistant"):
-            streamed = st.write_stream(
-                answer_chain.stream(
-                    {
-                        "context": context,
-                        "input": question,
-                        "chat_history": chat_history,
-                    }
+            try:
+                streamed = st.write_stream(
+                    answer_chain.stream(
+                        {
+                            "context": context,
+                            "input": question,
+                            "chat_history": chat_history,
+                        }
+                    )
                 )
-            )
+            except Exception as e:
+                streamed = (
+                    "⚠️ Sorry, the AI model encountered an error. "
+                    "Please try again in a moment."
+                )
+                st.markdown(streamed)
+                st.error(f"Details: {str(e)[:200]}")
 
             # ── Show citations ────────────────────────────────
             if citations:
